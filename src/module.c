@@ -5069,7 +5069,7 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
             errno = ENOTSUP;
             goto cleanup;
         }
-        acl_retval = ACLCheckAllUserCommandPerm(ctx->client->user,c->cmd,c->argv,c->argc,&acl_errpos);
+        acl_retval = ACLCheckAllUserCommandPerm(ctx->client->user,c->cmd,c->argv,c->argc,&acl_errpos, NULL, 0);
         if (acl_retval != ACL_OK) {
             sds object = (acl_retval == ACL_DENIED_CMD) ? sdsdup(c->cmd->fullname) : sdsdup(c->argv[acl_errpos]->ptr);
             addACLLogEntry(ctx->client, acl_retval, ACL_LOG_CTX_MODULE, -1, ctx->client->user->name, object);
@@ -7818,7 +7818,7 @@ int RM_ACLCheckCommandPermissions(RedisModuleUser *user, RedisModuleString **arg
         return REDISMODULE_ERR;
     }
 
-    if (ACLCheckAllUserCommandPerm(user->user, cmd, argv, argc, &keyidxptr) != ACL_OK) {
+    if (ACLCheckAllUserCommandPerm(user->user, cmd, argv, argc, &keyidxptr, NULL, 0) != ACL_OK) {
         errno = EACCES;
         return REDISMODULE_ERR;
     }

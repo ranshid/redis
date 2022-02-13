@@ -1899,6 +1899,12 @@ typedef struct {
                   CMD_KEY_* for more information */
 } keyReference;
 
+typedef struct {
+    robj *key; /* The pointer to the key object */
+    int flags; /* The flags associated with the key access, see
+                  CMD_KEY_* for more information */
+} externalKeyReference;
+
 /* A result structure for the various getkeys function calls. It lists the
  * keys as indices to the provided argv.
  */
@@ -2717,8 +2723,9 @@ void ACLClearCommandID(void);
 user *ACLGetUserByName(const char *name, size_t namelen);
 int ACLUserCheckKeyPerm(user *u, const char *key, int keylen, int flags);
 int ACLUserCheckChannelPerm(user *u, sds channel, int literal);
-int ACLCheckAllUserCommandPerm(user *u, struct redisCommand *cmd, robj **argv, int argc, int *idxptr);
+int ACLCheckAllUserCommandPerm(user *u, struct redisCommand *cmd, robj **argv, int argc, int *idxptr, externalKeyReference* external_keys, size_t external_keys_total);
 int ACLCheckAllPerm(client *c, int *idxptr);
+int ACLCheckAllPermWithExternalKeys(client *c, int *idxptr, externalKeyReference* external_keys, size_t external_keys_total);
 int ACLSetUser(user *u, const char *op, ssize_t oplen);
 uint64_t ACLGetCommandCategoryFlagByName(const char *name);
 int ACLAppendUserForLoading(sds *argv, int argc, int *argc_err);

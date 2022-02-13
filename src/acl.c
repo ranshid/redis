@@ -1604,7 +1604,7 @@ void cleanupACLKeyResultCache(aclKeyResultCache *cache) {
  * command cannot be executed because the selector is not allowed to run such
  * command, the second and third if the command is denied because the selector is trying
  * to access a key or channel that are not among the specified patterns. */
-static int ACLSelectorCheckCmd(aclSelector *selector, struct redisCommand *cmd, robj **argv, int argc, int *keyidxptr, aclKeyResultCache *cache) {
+static int ACLSelectorCheckCmd(aclSelector *selector, struct redisCommand *cmd, robj **argv, int argc, int *keyidxptr, aclKeyResultCache *cache, externalKeyReference *external_keys, size_t external_keys_total) {
     uint64_t id = cmd->id;
     int ret;
     if (!(selector->flags & SELECTOR_FLAG_ALLCOMMANDS) && !(cmd->flags & CMD_NO_AUTH)) {
@@ -1648,6 +1648,16 @@ static int ACLSelectorCheckCmd(aclSelector *selector, struct redisCommand *cmd, 
                 if (resultidx) *keyidxptr = resultidx[j].pos;
                 return ret;
             }
+        }
+    }
+
+    if (!(selector->flags & SELECTOR_FLAG_ALLKEYS) && external_keys_total > 0) {
+        for (size_t j = 0; j < external_keys_total; j++) {
+           ret = ACLSelectorCheckKey(selector,external_keys[j].key->ptr, sdslen(external_keys[j].key->ptr), external_keys[j].flags);
+           if (ret != ACL_OK) {
+               *keyidxptr = 0;
+               return ret;
+           }
         }
     }
 
@@ -1722,7 +1732,7 @@ int ACLUserCheckChannelPerm(user *u, sds channel, int literal) {
 }
 
 /* Lower level API that checks if a specified user is able to execute a given command. */
-int ACLCheckAllUserCommandPerm(user *u, struct redisCommand *cmd, robj **argv, int argc, int *idxptr) {
+int ACLCheckAllUserCommandPerm(user *u, struct redisCommand *cmd, robj **argv, int argc, int *idxptr, externalKeyReference *external_keys, size_t external_keys_total) {
     listIter li;
     listNode *ln;
 
@@ -1744,7 +1754,7 @@ int ACLCheckAllUserCommandPerm(user *u, struct redisCommand *cmd, robj **argv, i
     listRewind(u->selectors,&li);
     while((ln = listNext(&li))) {
         aclSelector *s = (aclSelector *) listNodeValue(ln);
-        int acl_retval = ACLSelectorCheckCmd(s, cmd, argv, argc, &local_idxptr, &cache);
+        int acl_retval = ACLSelectorCheckCmd(s, cmd, argv, argc, &local_idxptr, &cache, external_keys, external_keys_total);
         if (acl_retval == ACL_OK) {
             cleanupACLKeyResultCache(&cache);
             return ACL_OK;
@@ -1764,7 +1774,14 @@ int ACLCheckAllUserCommandPerm(user *u, struct redisCommand *cmd, robj **argv, i
 
 /* High level API for checking if a client can execute the queued up command */
 int ACLCheckAllPerm(client *c, int *idxptr) {
-    return ACLCheckAllUserCommandPerm(c->user, c->cmd, c->argv, c->argc, idxptr);
+    return ACLCheckAllUserCommandPerm(c->user, c->cmd, c->argv, c->argc, idxptr, NULL, 0);
+}
+
+/* High level API for checking if a client can execute the queued up command
+ * with an array of external keys accessed by this command
+ */
+int ACLCheckAllPermWithExternalKeys(client *c, int *idxptr, externalKeyReference* external_keys, size_t external_keys_total) {
+    return ACLCheckAllUserCommandPerm(c->user, c->cmd, c->argv, c->argc, idxptr, external_keys, external_keys_total);
 }
 
 /* Check if the user's existing pub/sub clients violate the ACL pub/sub
@@ -2813,7 +2830,7 @@ setuser_cleanup:
         }
 
         int idx;
-        int result = ACLCheckAllUserCommandPerm(u, cmd, c->argv + 3, c->argc - 3, &idx);
+        int result = ACLCheckAllUserCommandPerm(u, cmd, c->argv + 3, c->argc - 3, &idx, NULL, 0);
         if (result != ACL_OK) {
             sds err = sdsempty();
             if (result == ACL_DENIED_CMD) {

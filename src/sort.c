@@ -58,7 +58,7 @@ redisSortOperation *createSortOperation(int type, robj *pattern) {
  *
  * The returned object will always have its refcount increased by 1
  * when it is non-NULL. */
-robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
+robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst, robj **key) {
     char *p, *f, *k;
     sds spat, ssub;
     robj *keyobj, *fieldobj = NULL, *o;
@@ -122,7 +122,10 @@ robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
          * increased. sortCommand decreases it again. */
         incrRefCount(o);
     }
-    decrRefCount(keyobj);
+    if(key)
+        *key = keyobj;
+    else
+        decrRefCount(keyobj);
     if (fieldobj) decrRefCount(fieldobj);
     return o;
 
@@ -188,15 +191,17 @@ int sortCompare(const void *s1, const void *s2) {
  * is optimized for speed and a bit less for readability */
 void sortCommandGeneric(client *c, int readonly) {
     list *operations;
-    unsigned int outputlen = 0;
+    long outputlen = 0;
     int desc = 0, alpha = 0;
     long limit_start = 0, limit_count = -1, start, end;
-    int j, dontsort = 0, vectorlen;
+    long j, i, dontsort = 0, vectorlen;
     int getop = 0; /* GET operation counter */
     int int_conversion_error = 0;
     int syntax_error = 0;
+    int acl_retval = ACL_OK, acl_errpos = 0;;
     robj *sortval, *sortby = NULL, *storekey = NULL;
     redisSortObject *vector; /* Resulting vector to sort */
+    robj **outputvals = NULL;
 
     /* Create a list of operations to perform for every sorted element.
      * Operations can be GET */
@@ -447,14 +452,23 @@ void sortCommandGeneric(client *c, int readonly) {
     }
     serverAssertWithInfo(c,sortval,j == vectorlen);
 
+    externalKeyReference *external_keys = NULL;
+    size_t external_keys_total = (getop ? getop*(end-start+1) : 0) + (sortby ? vectorlen : 0);
+    size_t external_keys_num = 0;
+    if (external_keys_total) {
+        external_keys = zmalloc(sizeof(keyReference)*external_keys_total);
+    }
+
     /* Now it's time to load the right scores in the sorting vector */
     if (!dontsort) {
         for (j = 0; j < vectorlen; j++) {
             robj *byval;
+            robj *external_key;
             if (sortby) {
                 /* lookup value to sort by */
-                byval = lookupKeyByPattern(c->db,sortby,vector[j].obj);
+                byval = lookupKeyByPattern(c->db,sortby,vector[j].obj,&external_key);
                 if (!byval) continue;
+                external_keys[external_keys_num++] = (externalKeyReference) {external_key,CMD_KEY_ACCESS};
             } else {
                 /* use object itself to sort by */
                 byval = vector[j].obj;
@@ -501,93 +515,112 @@ void sortCommandGeneric(client *c, int readonly) {
 
     /* Send command output to the output buffer, performing the specified
      * GET/DEL/INCR/DECR operations if any. */
-    outputlen = getop ? getop*(end-start+1) : end-start+1;
     if (int_conversion_error) {
         addReplyError(c,"One or more scores can't be converted into double");
-    } else if (storekey == NULL) {
-        /* STORE option not specified, sent the sorting result to client */
-        addReplyArrayLen(c,outputlen);
-        for (j = start; j <= end; j++) {
+    } else {
+        outputlen = getop ? getop*(end-start+1) : end-start+1;
+        outputvals = zmalloc(sizeof(robj*)*outputlen);
+        for (i=0, j = start; j <= end; j++) {
             listNode *ln;
             listIter li;
-
-            if (!getop) addReplyBulk(c,vector[j].obj);
+            robj *external_key;
+            if (!getop) outputvals[i++] = vector[j].obj;
             listRewind(operations,&li);
             while((ln = listNext(&li))) {
                 redisSortOperation *sop = ln->value;
-                robj *val = lookupKeyByPattern(c->db,sop->pattern,
-                                               vector[j].obj);
-
                 if (sop->type == SORT_OP_GET) {
-                    if (!val) {
-                        addReplyNull(c);
-                    } else {
-                        addReplyBulk(c,val);
-                        decrRefCount(val);
-                    }
+                    robj *val = lookupKeyByPattern(c->db,sop->pattern,
+                                                   vector[j].obj,&external_key);
+                    outputvals[i++] = val;
+                    external_keys[external_keys_num++] = (externalKeyReference) {external_key,CMD_KEY_ACCESS};
                 } else {
                     /* Always fails */
                     serverAssertWithInfo(c,sortval,sop->type == SORT_OP_GET);
                 }
             }
         }
-    } else {
-        robj *sobj = createQuicklistObject();
 
-        /* STORE option specified, set the sorting result as a List object */
-        for (j = start; j <= end; j++) {
-            listNode *ln;
-            listIter li;
+        /* We match the command against ACL rules again after we collected the external keys.
+         * the is no issue running the command against the ACL rules during processCommand since we can bail sooner in case the command or parameters might not be authorized
+         * We need to run the command validation again here since the combination of the command, parameters and external keys might not match the rule which was first matched
+         * during processCommand
+         */
+        acl_retval = ACLCheckAllPermWithExternalKeys(c, &acl_errpos, external_keys, external_keys_total);
+        if (acl_retval != ACL_OK) {
+            addACLLogEntry(c,acl_retval,(c->flags & CLIENT_MULTI) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL,acl_errpos,NULL,NULL);
+            switch (acl_retval) {
+            case ACL_DENIED_CMD:
+            {
+                rejectCommandFormat(c,
+                    "-NOPERM this user has no permissions to run "
+                    "the '%s' command", c->cmd->fullname);
+                break;
+            }
+            case ACL_DENIED_KEY:
+                rejectCommandFormat(c,
+                    "-NOPERM this user has no permissions to access "
+                    "one of the keys accesses by the sort command");
+                break;
+            case ACL_DENIED_CHANNEL:
+            default:
+                rejectCommandFormat(c, "no permission");
+                break;
+            }
 
-            if (!getop) {
-                listTypePush(sobj,vector[j].obj,LIST_TAIL);
-            } else {
-                listRewind(operations,&li);
-                while((ln = listNext(&li))) {
-                    redisSortOperation *sop = ln->value;
-                    robj *val = lookupKeyByPattern(c->db,sop->pattern,
-                                                   vector[j].obj);
+         } else {
 
-                    if (sop->type == SORT_OP_GET) {
-                        if (!val) val = createStringObject("",0);
-
-                        /* listTypePush does an incrRefCount, so we should take care
-                         * care of the incremented refcount caused by either
-                         * lookupKeyByPattern or createStringObject("",0) */
-                        listTypePush(sobj,val,LIST_TAIL);
-                        decrRefCount(val);
+            if (storekey == NULL) {
+                /* STORE option not specified, sent the sorting result to client */
+                addReplyArrayLen(c,outputlen);
+                for (j = 0; j < outputlen; j++) {
+                    robj *val = outputvals[j];
+                    if (!val) {
+                        addReplyNull(c);
                     } else {
-                        /* Always fails */
-                        serverAssertWithInfo(c,sortval,sop->type == SORT_OP_GET);
+                        addReplyBulk(c,val);
+                        decrRefCount(val);
                     }
                 }
+            } else {
+                robj *sobj = createQuicklistObject();
+                /* STORE option specified, set the sorting result as a List object */
+                for (j = 0; j < outputlen; j++) {
+                    robj *val = outputvals[j];
+                    if (!val) val = createStringObject("",0);
+                    /* listTypePush does an incrRefCount, so we should take care
+                     * care of the incremented refcount caused by either
+                     * lookupKeyByPattern or createStringObject("",0) */
+                    listTypePush(sobj,val,LIST_TAIL);
+                    decrRefCount(val);
+                }
+
+                if (outputlen) {
+                    setKey(c,c->db,storekey,sobj,0);
+                    notifyKeyspaceEvent(NOTIFY_LIST,"sortstore",storekey,
+                                        c->db->id);
+                    server.dirty += outputlen;
+                } else if (dbDelete(c->db,storekey)) {
+                    signalModifiedKey(c,c->db,storekey);
+                    notifyKeyspaceEvent(NOTIFY_GENERIC,"del",storekey,c->db->id);
+                    server.dirty++;
+                }
+                decrRefCount(sobj);
+                addReplyLongLong(c,outputlen);
             }
         }
-        if (outputlen) {
-            setKey(c,c->db,storekey,sobj,0);
-            notifyKeyspaceEvent(NOTIFY_LIST,"sortstore",storekey,
-                                c->db->id);
-            server.dirty += outputlen;
-        } else if (dbDelete(c->db,storekey)) {
-            signalModifiedKey(c,c->db,storekey);
-            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",storekey,c->db->id);
-            server.dirty++;
-        }
-        decrRefCount(sobj);
-        addReplyLongLong(c,outputlen);
     }
 
     /* Cleanup */
-    for (j = 0; j < vectorlen; j++)
-        decrRefCount(vector[j].obj);
-
     decrRefCount(sortval);
     listRelease(operations);
     for (j = 0; j < vectorlen; j++) {
+        decrRefCount(vector[j].obj);
         if (alpha && vector[j].u.cmpobj)
             decrRefCount(vector[j].u.cmpobj);
     }
     zfree(vector);
+    zfree(outputvals);
+    zfree(external_keys);
 }
 
 /* SORT wrapper function for read-only mode. */
