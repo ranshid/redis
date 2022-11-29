@@ -2211,33 +2211,33 @@ foreach {pop} {BLPOP BLMPOP_RIGHT} {
         set rd3 [redis_deferring_client]
         
         # delete the list in case already exists
-        r del l1 l2 l3
+        r del {l}1 {l}2 {l}3
         
         # block a client on the list
-        $rd1 BRPOPLPUSH l1 l3 0
+        $rd1 BRPOPLPUSH {l}1 {l}3 0
         wait_for_blocked_clients_count 1
         
-        $rd2 BLPOP l2 0
+        $rd2 BLPOP {l}2 0
         wait_for_blocked_clients_count 2
         
-        $rd3 BLMPOP 0 2 l2 l3 LEFT COUNT 1
+        $rd3 BLMPOP 0 2 {l}2 {l}3 LEFT COUNT 1
         wait_for_blocked_clients_count 3
         
         r multi
-        r lpush l1 1
-        r lpush l2 2
+        r lpush {l}1 1
+        r lpush {l}2 2
         r exec
         
         wait_for_blocked_clients_count 0
         
         assert_equal [$rd1 read] {1}
-        assert_equal [$rd2 read] {l2 2}
-        assert_equal [$rd3 read] {l3 1}
+        assert_equal [$rd2 read] {{l}2 2}
+        assert_equal [$rd3 read] {{l}3 1}
         
         $rd1 close
         $rd2 close
         $rd3 close
-    } {} {cluster:skip}
+    }
     
     test "Blocking command acounted only once in commandstats" {
         # cleanup first
