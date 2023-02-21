@@ -3091,7 +3091,7 @@ void clusterBroadcastPong(int target) {
  * the 'bulk_data', sanitizer generates an out-of-bounds error which is a false
  * positive in this context. */
 REDIS_NO_SANITIZE("bounds")
-void clusterSendPublish(clusterLink *link, robj *channel, robj *message, uint16_t type) {
+void clusterSendPublish(clusterLink *link, robj *channel, robj *message, uint16_t type, int bcast) {
     unsigned char *payload;
     clusterMsg buf[1];
     clusterMsg *hdr = (clusterMsg*) buf;
@@ -3123,7 +3123,7 @@ void clusterSendPublish(clusterLink *link, robj *channel, robj *message, uint16_
     memcpy(hdr->data.publish.msg.bulk_data+sdslen(channel->ptr),
         message->ptr,sdslen(message->ptr));
 
-    if (link)
+    if (!bcast)
         clusterSendMessage(link,payload,totlen);
     else
         clusterBroadcastMessage(payload,totlen);
@@ -3230,7 +3230,7 @@ int clusterSendModuleMessageToTarget(const char *target, uint64_t module_id, uin
  * -------------------------------------------------------------------------- */
 void clusterPropagatePublish(robj *channel, robj *message, int sharded) {
     if (!sharded) {
-        clusterSendPublish(NULL, channel, message, CLUSTERMSG_TYPE_PUBLISH);
+        clusterSendPublish(NULL, channel, message, CLUSTERMSG_TYPE_PUBLISH, 1);
         return;
     }
 
@@ -3242,7 +3242,7 @@ void clusterPropagatePublish(robj *channel, robj *message, int sharded) {
         while((ln = listNext(&li))) {
             clusterNode *node = listNodeValue(ln);
             if (node != myself) {
-                clusterSendPublish(node->link, channel, message, CLUSTERMSG_TYPE_PUBLISHSHARD);
+                clusterSendPublish(node->link, channel, message, CLUSTERMSG_TYPE_PUBLISHSHARD, 0);
             }
         }
     }
