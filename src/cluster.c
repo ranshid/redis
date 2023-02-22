@@ -3098,6 +3098,11 @@ void clusterSendPublish(clusterLink *link, robj *channel, robj *message, uint16_
     uint32_t totlen;
     uint32_t channel_len, message_len;
 
+    /* In case we are not going to broadcast we have no point trying to publish on a missing
+     * clusterbus link. */
+    if (!bcast && !link)
+        return;
+
     channel = getDecodedObject(channel);
     message = getDecodedObject(message);
     channel_len = sdslen(channel->ptr);
